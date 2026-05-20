@@ -1,0 +1,6 @@
+{
+  "name": "Night Drifter",
+  "description": "A 3D car driving game fetched from OpenStreetMap using Mapbox GL JS with realistic driving physics and minimalist UI.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
