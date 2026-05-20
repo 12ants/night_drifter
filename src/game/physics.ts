@@ -1,3 +1,5 @@
+import { CarConfig, CAR_MODELS } from './cars';
+
 export interface CarState {
   x: number; // longitude
   y: number; // latitude
@@ -19,19 +21,10 @@ const METERS_PER_DEGREE_LAT = 111320;
 
 export class CarPhysics {
   state: CarState;
+  config: CarConfig;
   
-  // Physics constants
-  engineForce = 15; // m/s^2 acceleration (higher for more punch)
-  brakingForce = 35; // m/s^2 braking
-  airDrag = 0.01; // resistance at high speeds
-  rollingResistance = 2.0; // constant friction
-  turnSpeed = 120; // max degrees/s rotation torque
-  
-  // Grip settings
-  lateralGrip = 8.0; // lateral friction coefficient
-  driftGrip = 1.0; // friction when drifting (handbrake)
-
-  constructor(initialState: Partial<CarState>) {
+  constructor(initialState: Partial<CarState>, configId: string = 'sport') {
+    this.config = CAR_MODELS[configId] || CAR_MODELS['sport'];
     this.state = {
       x: initialState.x || 0,
       y: initialState.y || 0,
@@ -59,36 +52,32 @@ export class CarPhysics {
     // Apply engine / brakes
     let longitudinalForce = 0;
     if (input.forward) {
-      longitudinalForce += this.engineForce;
+      longitudinalForce += this.config.engineForce;
     } 
     if (input.backward) {
-      // If moving forward, brake. If stopped/reverse, reverse.
       if (forwardSpeed > 1) {
-        longitudinalForce -= this.brakingForce;
+        longitudinalForce -= this.config.brakingForce;
       } else {
-        longitudinalForce -= this.engineForce * 0.5; // reverse is slower
+        longitudinalForce -= this.config.engineForce * 0.5; // reverse is slower
       }
     }
 
     // Apply drag and rolling resistance
     if (Math.abs(forwardSpeed) > 0.1) {
-      longitudinalForce -= Math.sign(forwardSpeed) * this.rollingResistance;
-      longitudinalForce -= forwardSpeed * Math.abs(forwardSpeed) * this.airDrag;
+      longitudinalForce -= Math.sign(forwardSpeed) * this.config.rollingResistance;
+      longitudinalForce -= forwardSpeed * Math.abs(forwardSpeed) * this.config.airDrag;
     } else if (!input.forward && !input.backward) {
       forwardSpeed = 0; // complete stop
     }
 
     // Apply lateral grip (friction)
-    let currentGrip = input.handbrake ? this.driftGrip : this.lateralGrip;
+    let currentGrip = input.handbrake ? this.config.driftGrip : this.config.lateralGrip;
     let lateralForce = -lateralSpeed * currentGrip;
     
-    // If handbraking while moving forward, lose a lot of speed to friction
+    let turnSpeed = this.config.turnSpeed;
     if (input.handbrake && forwardSpeed > 1) {
-       longitudinalForce -= this.brakingForce * 0.8;
-       // Increase turn speed aggressively during drift for arcade feel
-       this.turnSpeed = 160; 
-    } else {
-       this.turnSpeed = 90;
+       longitudinalForce -= this.config.brakingForce * 0.8;
+       turnSpeed = this.config.turnSpeed * 1.5; // more rotation on handbrake
     }
 
     // Update local velocities
@@ -103,7 +92,7 @@ export class CarPhysics {
       // Reverse steering logic when reversing
       if (forwardSpeed < 0) turnAmount *= -1;
       
-      targetAngularVelocity = turnAmount * this.turnSpeed;
+      targetAngularVelocity = turnAmount * turnSpeed;
     }
     
     // Smooth angular velocity for weight transfer feel

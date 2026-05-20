@@ -3,6 +3,7 @@ import mapboxgl from 'mapbox-gl';
 import 'mapbox-gl/dist/mapbox-gl.css';
 import { CarPhysics, CarState, InputState } from '../game/physics';
 import { getCarPolygon } from '../game/carGeometry';
+import { CAR_MODELS } from '../game/cars';
 import { Settings, X } from 'lucide-react';
 
 const LOCATIONS: Record<string, { x: number; y: number }> = {
@@ -22,12 +23,6 @@ const MAP_STYLES: Record<string, string> = {
 
 const LIGHT_PRESETS = ['dawn', 'day', 'dusk', 'night'];
 
-const CAMERA_MODES = [
-  { id: 'chase', name: 'Chase View', pitch: 65, baseZoom: 18 },
-  { id: 'top-down', name: 'Top Down', pitch: 0, baseZoom: 16.5 },
-  { id: 'cinematic', name: 'Cinematic', pitch: 45, baseZoom: 15 },
-];
-
 interface MapGameProps {
   accessToken: string;
 }
@@ -43,30 +38,8 @@ export default function MapGame({ accessToken }: MapGameProps) {
   const [locationName, setLocationName] = useState('Stockholm');
   const [mapStyleName, setMapStyleName] = useState('Standard 3D');
   const [lightPreset, setLightPreset] = useState('dusk');
+  const [carModelId, setCarModelId] = useState('offroad');
   const [menuOpen, setMenuOpen] = useState(false);
-  const [cameraModeIndex, setCameraModeIndex] = useState(0);
-
-  const cameraRef = useRef({
-    modeIndex: 0,
-    zoomOffset: 0,
-    currentPitch: CAMERA_MODES[0].pitch,
-    currentZoom: CAMERA_MODES[0].baseZoom
-  });
-
-  useEffect(() => {
-    cameraRef.current.modeIndex = cameraModeIndex;
-  }, [cameraModeIndex]);
-
-  useEffect(() => {
-    const handleWheel = (e: WheelEvent) => {
-      // Zoom out if scrolling down (positive delta), zoom in if scrolling up
-      cameraRef.current.zoomOffset -= e.deltaY * 0.002;
-      // Clamp offset so zoom doesn't go crazy
-      cameraRef.current.zoomOffset = Math.max(-5, Math.min(cameraRef.current.zoomOffset, 5));
-    };
-    window.addEventListener('wheel', handleWheel, { passive: true });
-    return () => window.removeEventListener('wheel', handleWheel);
-  }, []);
 
   const currentCoords = LOCATIONS[locationName];
 
@@ -75,16 +48,17 @@ export default function MapGame({ accessToken }: MapGameProps) {
     x: currentCoords.x,
     y: currentCoords.y,
     heading: 0,
-    speed: 0,
-    steeringAngle: 0
+    velocityX: 0,
+    velocityY: 0,
+    angularVelocity: 0
   }), [locationName]);
 
-  const physicsRef = useRef(new CarPhysics(initialCarState));
+  const physicsRef = useRef(new CarPhysics(initialCarState, carModelId));
 
   // Reset physics state when initialization changes
   useEffect(() => {
-    physicsRef.current = new CarPhysics(initialCarState);
-  }, [initialCarState]);
+    physicsRef.current = new CarPhysics(initialCarState, carModelId);
+  }, [initialCarState, carModelId]);
   
   const inputRef = useRef<InputState>({
     forward: false,
@@ -209,46 +183,10 @@ export default function MapGame({ accessToken }: MapGameProps) {
       // Keep hiding dynamically loaded layers (especially for Standard style)
       map.on('styledata', hideClutter);
 
-      // Add Particles Layer
-      if (!map.getSource('particles-source')) {
-        map.addSource('particles-source', {
-          type: 'geojson',
-          data: { type: 'FeatureCollection', features: [] }
-        });
-        
-        map.addLayer({
-          id: 'particles-smoke',
-          type: 'circle',
-          source: 'particles-source',
-          filter: ['==', 'type', 'smoke'],
-          paint: {
-            'circle-radius': ['interpolate', ['linear'], ['get', 'life'], 0, 12, 1, 3],
-            'circle-color': '#d1d5db',
-            'circle-opacity': ['interpolate', ['linear'], ['get', 'life'], 0, 0, 1, 0.5],
-            'circle-blur': 1,
-            'circle-pitch-alignment': 'map'
-          }
-        });
-
-        map.addLayer({
-          id: 'particles-water',
-          type: 'circle',
-          source: 'particles-source',
-          filter: ['==', 'type', 'water'],
-          paint: {
-            'circle-radius': ['interpolate', ['linear'], ['get', 'life'], 0, 8, 1, 2],
-            'circle-color': '#00e5ff',
-            'circle-opacity': ['interpolate', ['linear'], ['get', 'life'], 0, 0, 1, 0.7],
-            'circle-blur': 0.5,
-            'circle-pitch-alignment': 'map'
-          }
-        });
-      }
-
       // Add Car Layer
       map.addSource('car-source', {
         type: 'geojson',
-        data: getCarPolygon(initialCarState.x, initialCarState.y, initialCarState.heading) as GeoJSON.Feature
+        data: getCarPolygon(initialCarState.x, initialCarState.y, initialCarState.heading, carModelId) as unknown as GeoJSON.FeatureCollection
       });
 
       map.addLayer({
@@ -267,9 +205,6 @@ export default function MapGame({ accessToken }: MapGameProps) {
       let lastTime = performance.now();
       let lastStateUpdate = performance.now();
       let animationFrameId: number;
-      
-      let particles: {id: number; x: number; y: number; life: number; type: string}[] = [];
-      let particleIdCounter = 0;
 
       const loop = (time: number) => {
         const dt = (time - lastTime) / 1000;
@@ -290,7 +225,10 @@ export default function MapGame({ accessToken }: MapGameProps) {
           let water = false;
 
           try {
-            const polygon = getCarPolygon(lng, lat, heading).geometry.coordinates[0] as [number, number][];
+            const carGeoJSON = getCarPolygon(lng, lat, heading, carModelId);
+            // First feature is the car body, which is good enough for collision points
+            const mainBody = carGeoJSON.features[0];
+            const polygon = mainBody.geometry.coordinates[0] as [number, number][];
             const pointsToCheck = [
               map.project(polygon[0] as [number, number]),
               map.project(polygon[1] as [number, number]),
@@ -324,77 +262,18 @@ export default function MapGame({ accessToken }: MapGameProps) {
           lastStateUpdate = time;
         }
 
-        // Particle generation
-        const speedKmh = physics.speed * 3.6;
-        const currentEnv = checkEnvironment(physics.state.x, physics.state.y, physics.state.heading);
-        const inWater = currentEnv.water;
-        const drifting = inputRef.current.handbrake && speedKmh > 15;
-
-        if (speedKmh > 5 && (inWater || drifting)) {
-          // Add particles
-          for (let i = 0; i < 2; i++) {
-             const angleRad = (90 - physics.state.heading + 180) * (Math.PI / 180);
-             const backDist = 0.000015; // behind the car
-             const px = physics.state.x + Math.cos(angleRad) * backDist + (Math.random() - 0.5) * 0.00001;
-             const py = physics.state.y + Math.sin(angleRad) * backDist + (Math.random() - 0.5) * 0.00001;
-             particles.push({
-               id: particleIdCounter++,
-               x: px,
-               y: py,
-               life: 1.0,
-               type: inWater ? 'water' : 'smoke'
-             });
-          }
-        }
-
-        // Update particles
-        let particlesChanged = false;
-        if (particles.length > 0 || (inWater || drifting)) {
-           particlesChanged = true;
-           particles = particles.filter(p => {
-             // die quicker in water vs smoke
-             p.life -= dt * (p.type === 'water' ? 2.5 : 1.2);
-             return p.life > 0;
-           });
-        }
-
         const carMoved = prevX !== physics.state.x || prevY !== physics.state.y || prevHeading !== physics.state.heading;
-
-        // Camera interpolation
-        const cState = cameraRef.current;
-        const targetMode = CAMERA_MODES[cState.modeIndex];
-        const targetPitch = targetMode.pitch;
-        const targetZoom = targetMode.baseZoom + cState.zoomOffset;
-        
-        cState.currentPitch += (targetPitch - cState.currentPitch) * 5 * dt;
-        cState.currentZoom += (targetZoom - cState.currentZoom) * 5 * dt;
 
         if (carMoved) {
           // Update car source
           const carSource = map.getSource('car-source') as mapboxgl.GeoJSONSource;
           if (carSource) {
-            carSource.setData(getCarPolygon(physics.state.x, physics.state.y, physics.state.heading) as unknown as GeoJSON.FeatureCollection);
+            carSource.setData(getCarPolygon(physics.state.x, physics.state.y, physics.state.heading, carModelId) as unknown as GeoJSON.FeatureCollection);
           }
-        }
-        
-        // Update camera (always track position, heading, and interpolated zoom/pitch)
-        map.setCenter([physics.state.x, physics.state.y]);
-        map.setBearing(physics.state.heading);
-        map.setZoom(cState.currentZoom);
-        map.setPitch(cState.currentPitch);
 
-        if (particlesChanged) {
-           const pSource = map.getSource('particles-source') as mapboxgl.GeoJSONSource;
-           if (pSource) {
-             pSource.setData({
-               type: 'FeatureCollection',
-               features: particles.map(p => ({
-                 type: 'Feature',
-                 properties: { type: p.type, life: p.life },
-                 geometry: { type: 'Point', coordinates: [p.x, p.y] }
-               }))
-             } as GeoJSON.FeatureCollection);
-           }
+          // Camera follow
+          map.setCenter([physics.state.x, physics.state.y]);
+          map.setBearing(physics.state.heading);
         }
 
         animationFrameId = requestAnimationFrame(loop);
@@ -408,12 +287,11 @@ export default function MapGame({ accessToken }: MapGameProps) {
     return () => {
       map.remove();
     };
-  }, [accessToken, initialCarState, mapStyleName, lightPreset]);
+  }, [accessToken, initialCarState, mapStyleName, lightPreset, carModelId]);
 
   // Input handling
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.repeat) return; // Ignore hold repeats for things like 'c'
       const state = inputRef.current;
       switch (e.code) {
         case 'ArrowUp':
@@ -425,7 +303,6 @@ export default function MapGame({ accessToken }: MapGameProps) {
         case 'ArrowRight':
         case 'KeyD': state.right = true; break;
         case 'Space': state.handbrake = true; break;
-        case 'KeyC': setCameraModeIndex(i => (i + 1) % CAMERA_MODES.length); break;
       }
     };
 
@@ -487,16 +364,12 @@ export default function MapGame({ accessToken }: MapGameProps) {
         </div>
       </div>
       
-      <div className="absolute bottom-6 left-0 right-0 flex justify-center pointer-events-none z-10">
-        <div className="flex flex-wrap justify-center gap-4 text-xs opacity-70 font-bold tracking-widest bg-black/50 px-4 py-2 rounded text-white border border-neutral-800">
-          <span>[W] GAS</span>
-          <span>[S] BRAKE</span>
-          <span>[A] LEFT</span>
-          <span>[D] RIGHT</span>
-          <span>[SPACE] E-BRAKE</span>
-          <span>[C] CAMERA ({CAMERA_MODES[cameraModeIndex].name})</span>
-          <span>[SCROLL] ZOOM</span>
-        </div>
+      <div className="absolute bottom-6 left-1/2 -translate-x-1/2 flex gap-4 text-xs opacity-70 z-10 pointer-events-none font-bold tracking-widest bg-black/50 px-4 py-2 rounded text-white">
+        <span>[W] GAS</span>
+        <span>[S] BRAKE</span>
+        <span>[A] LEFT</span>
+        <span>[D] RIGHT</span>
+        <span>[SPACE] E-BRAKE</span>
       </div>
 
       {/* Settings Menu Modal */}
@@ -511,6 +384,19 @@ export default function MapGame({ accessToken }: MapGameProps) {
             </div>
 
             <div className="space-y-6">
+              <div>
+                <label className="block text-xs font-bold tracking-widest text-neutral-400 mb-2 uppercase">Vehicle</label>
+                <select 
+                  className="w-full bg-black border border-neutral-700 text-white rounded p-2 focus:border-[#ff3366] outline-none transition-colors font-mono"
+                  value={carModelId}
+                  onChange={(e) => setCarModelId(e.target.value)}
+                >
+                  {Object.values(CAR_MODELS).map((model) => (
+                    <option key={model.id} value={model.id}>{model.name}</option>
+                  ))}
+                </select>
+              </div>
+
               <div>
                 <label className="block text-xs font-bold tracking-widest text-neutral-400 mb-2 uppercase">Location</label>
                 <select 
