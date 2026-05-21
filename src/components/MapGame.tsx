@@ -39,6 +39,7 @@ export default function MapGame({ accessToken }: MapGameProps) {
   const [mapStyleName, setMapStyleName] = useState('Standard 3D');
   const [lightPreset, setLightPreset] = useState('dusk');
   const [carModelId, setCarModelId] = useState('offroad');
+  const [cameraMode, setCameraMode] = useState<'chase' | 'cockpit' | 'freecam'>('chase');
   const [menuOpen, setMenuOpen] = useState(false);
 
   const currentCoords = LOCATIONS[locationName];
@@ -54,6 +55,38 @@ export default function MapGame({ accessToken }: MapGameProps) {
   }), [locationName]);
 
   const physicsRef = useRef(new CarPhysics(initialCarState, carModelId));
+  const cameraModeRef = useRef(cameraMode);
+  const headlightsOnRef = useRef(true);
+  
+  // Smooth Camera State
+  const cameraStateRef = useRef({ 
+    lng: initialCarState.x, 
+    lat: initialCarState.y, 
+    bearing: initialCarState.heading,
+    pitch: 80,
+    zoom: 20
+  });
+
+  // Skid marks state
+  const activeSkidsRef = useRef<{ left: number[][], right: number[][] } | null>(null);
+  const allSkidsRef = useRef<{ id: number; left: number[][]; right: number[][]; timestamp: number }[]>([]);
+
+  // Light streaks state
+  const activeStreaksRef = useRef<{ 
+    headL: number[][], headR: number[][], 
+    tailL: number[][], tailR: number[][] 
+  } | null>(null);
+  
+  const allStreaksRef = useRef<{ 
+    id: number; 
+    headL: number[][]; headR: number[][]; 
+    tailL: number[][]; tailR: number[][]; 
+    timestamp: number 
+  }[]>([]);
+
+  useEffect(() => {
+    cameraModeRef.current = cameraMode;
+  }, [cameraMode]);
 
   // Reset physics state when initialization changes
   useEffect(() => {
@@ -79,16 +112,24 @@ export default function MapGame({ accessToken }: MapGameProps) {
     setMapError(null);
     mapboxgl.accessToken = accessToken;
 
+    activeSkidsRef.current = null;
+    allSkidsRef.current = [];
+    activeStreaksRef.current = null;
+    allStreaksRef.current = [];
+
     const map = new mapboxgl.Map({
       container: mapContainer.current,
       style: MAP_STYLES[mapStyleName],
       center: [initialCarState.x, initialCarState.y],
-      zoom: 18,
-      pitch: 65, // Low camera angle
+      zoom: 20,
+      pitch: 80, // Lower to the ground
       bearing: initialCarState.heading,
       antialias: true
     });
     mapRef.current = map;
+
+    let isUnmounted = false;
+    let animationFrameId: number;
 
     map.on('error', (e) => {
       console.error('Mapbox error:', e);
@@ -98,6 +139,7 @@ export default function MapGame({ accessToken }: MapGameProps) {
     });
 
     map.on('style.load', () => {
+      if (isUnmounted) return;
       // Configure realistic lighting / shadows
       if (MAP_STYLES[mapStyleName] === 'mapbox://styles/mapbox/standard') {
         map.setConfigProperty('basemap', 'lightPreset', lightPreset);
@@ -118,8 +160,44 @@ export default function MapGame({ accessToken }: MapGameProps) {
           'tileSize': 512,
           'maxzoom': 14
         });
-        map.setTerrain({ 'source': 'mapbox-dem', 'exaggeration': 1.2 });
+        map.setTerrain({ 'source': 'mapbox-dem', 'exaggeration': 0.5 });
       }
+
+      // Add Atmospheric Fog / Haze
+      let fogRange: [number, number] = [1.5, 8]; // Lighter by default
+      let fogColor = '#c6dbfa';
+      let fogHighColor = '#c6dbfa';
+      let fogSpaceColor = '#3a7cf0';
+      let starIntensity = 0.0;
+      
+      if (lightPreset === 'night') {
+          fogRange = [0.1, 2.5]; // Denser
+          fogColor = '#020412';
+          fogHighColor = '#0b1026';
+          fogSpaceColor = '#020412';
+          starIntensity = 0.8;
+      } else if (lightPreset === 'dusk') {
+          fogRange = [0.5, 3]; // Denser
+          fogColor = '#36242c';
+          fogHighColor = '#1a0b16';
+          fogSpaceColor = '#080312';
+          starIntensity = 0.3;
+      } else if (lightPreset === 'dawn') {
+          fogRange = [1.5, 8];
+          fogColor = '#9a818c';
+          fogHighColor = '#503554';
+          fogSpaceColor = '#191536';
+          starIntensity = 0.1;
+      }
+
+      map.setFog({
+          'range': fogRange as [number, number],
+          'color': fogColor,
+          'horizon-blend': 0.1,
+          'high-color': fogHighColor,
+          'space-color': fogSpaceColor,
+          'star-intensity': starIntensity
+      });
 
       // Add invisible 2D collision layers
       if (!map.getSource('collision-source')) {
@@ -183,6 +261,49 @@ export default function MapGame({ accessToken }: MapGameProps) {
       // Keep hiding dynamically loaded layers (especially for Standard style)
       map.on('styledata', hideClutter);
 
+      // Add Skid Marks Layer
+      map.addSource('skid-marks-source', {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: [] }
+      });
+
+      map.addLayer({
+        id: 'skid-marks-layer',
+        type: 'line',
+        source: 'skid-marks-source',
+        layout: {
+          'line-join': 'round',
+          'line-cap': 'round'
+        },
+        paint: {
+          'line-color': '#111',
+          'line-width': 4,
+          'line-opacity': ['get', 'opacity']
+        }
+      });
+
+      // Add Light Streaks Layer
+      map.addSource('light-streaks-source', {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: [] }
+      });
+
+      map.addLayer({
+        id: 'light-streaks-layer',
+        type: 'line',
+        source: 'light-streaks-source',
+        layout: {
+          'line-join': 'round',
+          'line-cap': 'round'
+        },
+        paint: {
+          'line-color': ['get', 'color'],
+          'line-width': ['get', 'width'],
+          'line-opacity': ['get', 'opacity'],
+          'line-blur': 2
+        }
+      });
+
       // Add Car Layer
       map.addSource('car-source', {
         type: 'geojson',
@@ -204,9 +325,9 @@ export default function MapGame({ accessToken }: MapGameProps) {
       // Loop variables
       let lastTime = performance.now();
       let lastStateUpdate = performance.now();
-      let animationFrameId: number;
 
       const loop = (time: number) => {
+        if (isUnmounted) return;
         const dt = (time - lastTime) / 1000;
         lastTime = time;
 
@@ -219,21 +340,19 @@ export default function MapGame({ accessToken }: MapGameProps) {
         
         // Environment check
         const checkEnvironment = (lng: number, lat: number, heading: number) => {
-          if (!map) return { collide: false, water: false };
+          let env = { collide: false, water: false, groundZ: 0, pitch: 0, roll: 0 };
+          if (!map || isUnmounted) return env;
           
-          let collide = false;
-          let water = false;
-
           try {
-            const carGeoJSON = getCarPolygon(lng, lat, heading, carModelId);
-            // First feature is the car body, which is good enough for collision points
+            const carGeoJSON = getCarPolygon(lng, lat, heading, carModelId, 0, 0, 0); // Need to pass z=0 pitch=0 roll=0 for base polygon
+            // First feature is the car body
             const mainBody = carGeoJSON.features[0];
             const polygon = mainBody.geometry.coordinates[0] as [number, number][];
             const pointsToCheck = [
-              map.project(polygon[0] as [number, number]),
-              map.project(polygon[1] as [number, number]),
-              map.project(polygon[2] as [number, number]),
-              map.project(polygon[3] as [number, number]),
+              map.project(polygon[0] as [number, number]), // FL
+              map.project(polygon[1] as [number, number]), // FR
+              map.project(polygon[2] as [number, number]), // BR
+              map.project(polygon[3] as [number, number]), // BL
               map.project([lng, lat]) // Center
             ];
 
@@ -243,48 +362,286 @@ export default function MapGame({ accessToken }: MapGameProps) {
               });
               
               for (const f of features) {
-                if (f.layer.id === 'collision-buildings') collide = true;
-                if (f.layer.id === 'collision-water') water = true;
+                if (f.layer.id === 'collision-buildings') env.collide = true;
+                if (f.layer.id === 'collision-water') env.water = true;
               }
             }
+
+            // query terrain elevation
+            const evC = map.queryTerrainElevation([lng, lat]) || 0;
+            const evFL = map.queryTerrainElevation(polygon[0] as [number, number]) || evC;
+            const evFR = map.queryTerrainElevation(polygon[1] as [number, number]) || evC;
+            const evBR = map.queryTerrainElevation(polygon[2] as [number, number]) || evC;
+            const evBL = map.queryTerrainElevation(polygon[3] as [number, number]) || evC;
+
+            env.groundZ = evC;
+
+            // Approximate pitch and roll in degrees based on wheel elevations
+            // pitch: front diff vs back diff
+            const length = CAR_MODELS[carModelId]?.length || 4;
+            const width = CAR_MODELS[carModelId]?.width || 2;
+            
+            const frontZ = (evFL + evFR) / 2;
+            const backZ = (evBL + evBR) / 2;
+            const leftZ = (evFL + evBL) / 2;
+            const rightZ = (evFR + evBR) / 2;
+            
+            env.pitch = Math.atan2(frontZ - backZ, length) * (180 / Math.PI); 
+            env.roll = Math.atan2(leftZ - rightZ, width) * (180 / Math.PI);
+
           } catch (e) {
             // Layers may not be styled yet or out of bounds
-            return { collide: false, water: false };
           }
           
-          return { collide, water };
+          return env;
         };
         
         physics.update(inputRef.current, dt, checkEnvironment);
+
+        // Skid marks logic
+        let runSkidUpdate = false;
+        const currentGroundZ = map.isStyleLoaded() ? (map.queryTerrainElevation([physics.state.x, physics.state.y]) || 0) : 0;
+        const relativeZ = Math.max(0, physics.state.z - currentGroundZ);
+        
+        const isDrifting = physics.state.slipAmount > 2.5 && relativeZ < 0.2;
+        
+        if (isDrifting && map.isStyleLoaded()) {
+            const headingRad = -physics.state.heading * (Math.PI / 180);
+            const cosA = Math.cos(headingRad);
+            const sinA = Math.sin(headingRad);
+            const config = CAR_MODELS[carModelId];
+            const L = config?.length || 4;
+            const W = config?.width || 2;
+            const wheelL = W / 2 - 0.1;
+            const wheelB = -L / 2 + 0.5;
+            
+            const METERS_PER_DEGREE_LAT = 111320;
+            const metersPerDegreeLng = METERS_PER_DEGREE_LAT * Math.cos(physics.state.y * Math.PI / 180);
+
+            const getPos = (f: number, l: number) => [
+              physics.state.x + (cosA * f - sinA * l) / metersPerDegreeLng,
+              physics.state.y + (sinA * f + cosA * l) / METERS_PER_DEGREE_LAT
+            ];
+
+            const leftPos = getPos(wheelB, wheelL);
+            const rightPos = getPos(wheelB, -wheelL);
+
+            if (activeSkidsRef.current) {
+                allSkidsRef.current.push({
+                   id: performance.now(),
+                   left: [activeSkidsRef.current.left[1] || activeSkidsRef.current.left[0], leftPos],
+                   right: [activeSkidsRef.current.right[1] || activeSkidsRef.current.right[0], rightPos],
+                   timestamp: performance.now()
+                });
+            }
+            // we will just store the last position in activeSkidsRef as a 1-length array to keep types consistent
+            activeSkidsRef.current = { left: [leftPos], right: [rightPos] };
+            runSkidUpdate = true;
+        } else {
+            activeSkidsRef.current = null;
+        }
+
+        if (allSkidsRef.current.length > 0) {
+            runSkidUpdate = true;
+        }
+
+        if (runSkidUpdate && map.isStyleLoaded()) {
+            const now = performance.now();
+            allSkidsRef.current = allSkidsRef.current.filter(skid => now - skid.timestamp < 3000); // 3 seconds fade
+            
+            try {
+                const skidSource = map.getSource('skid-marks-source') as mapboxgl.GeoJSONSource;
+                if (skidSource) {
+                    const features: any[] = [];
+                    for (const skid of allSkidsRef.current) {
+                        if (skid.left.length < 2) continue;
+                        let opacity = 0.5 * (1.0 - ((now - skid.timestamp) / 3000));
+                        if (opacity < 0) opacity = 0;
+                        features.push({
+                            type: 'Feature',
+                            properties: { opacity },
+                            geometry: { type: 'LineString', coordinates: skid.left }
+                        });
+                        features.push({
+                            type: 'Feature',
+                            properties: { opacity },
+                            geometry: { type: 'LineString', coordinates: skid.right }
+                        });
+                    }
+                    skidSource.setData({ type: 'FeatureCollection', features } as any);
+                }
+            } catch (e) {}
+        }
+
+        // Light streaks logic
+        let runStreakUpdate = false;
+        const isNight = lightPreset === 'night' || lightPreset === 'dusk';
+        // Give trail when moving reasonably fast and slipping, or at very high speeds. Look cool. 
+        // For simplicity: sliding, or just high speed
+        const speed = Math.sqrt(physics.state.velocityX**2 + physics.state.velocityY**2);
+        const isStreaking = isNight && (speed > 10 || isDrifting);
+
+        if (isStreaking && map.isStyleLoaded()) {
+            const headingRad = -physics.state.heading * (Math.PI / 180);
+            const cosA = Math.cos(headingRad);
+            const sinA = Math.sin(headingRad);
+            const config = CAR_MODELS[carModelId];
+            const L = config?.length || 4;
+            const W = config?.width || 2;
+            
+            const METERS_PER_DEGREE_LAT = 111320;
+            const metersPerDegreeLng = METERS_PER_DEGREE_LAT * Math.cos(physics.state.y * Math.PI / 180);
+
+            const getPos = (f: number, l: number) => [
+              physics.state.x + (cosA * f - sinA * l) / metersPerDegreeLng,
+              physics.state.y + (sinA * f + cosA * l) / METERS_PER_DEGREE_LAT
+            ];
+            
+            // Adjust to headlight and taillight positions
+            const headLPos = getPos(L / 2, Math.max(0.5, W / 2 - 0.2));
+            const headRPos = getPos(L / 2, -Math.max(0.5, W / 2 - 0.2));
+            const tailLPos = getPos(-L / 2, Math.max(0.5, W / 2 - 0.2));
+            const tailRPos = getPos(-L / 2, -Math.max(0.5, W / 2 - 0.2));
+
+            if (activeStreaksRef.current) {
+                allStreaksRef.current.push({
+                   id: performance.now(),
+                   headL: [activeStreaksRef.current.headL[1] || activeStreaksRef.current.headL[0], headLPos],
+                   headR: [activeStreaksRef.current.headR[1] || activeStreaksRef.current.headR[0], headRPos],
+                   tailL: [activeStreaksRef.current.tailL[1] || activeStreaksRef.current.tailL[0], tailLPos],
+                   tailR: [activeStreaksRef.current.tailR[1] || activeStreaksRef.current.tailR[0], tailRPos],
+                   timestamp: performance.now()
+                });
+            }
+            activeStreaksRef.current = { 
+                headL: [headLPos], headR: [headRPos],
+                tailL: [tailLPos], tailR: [tailRPos]
+            };
+            runStreakUpdate = true;
+        } else {
+            activeStreaksRef.current = null;
+        }
+
+        if (allStreaksRef.current.length > 0) runStreakUpdate = true;
+
+        if (runStreakUpdate && map.isStyleLoaded()) {
+            const now = performance.now();
+            const streakDuration = 300; // Fast fade out to keep it looking like streaks!
+            allStreaksRef.current = allStreaksRef.current.filter(s => now - s.timestamp < streakDuration);
+            
+            try {
+                const streakSource = map.getSource('light-streaks-source') as mapboxgl.GeoJSONSource;
+                if (streakSource) {
+                    const features: any[] = [];
+                    for (const streak of allStreaksRef.current) {
+                        let opacity = (1.0 - ((now - streak.timestamp) / streakDuration));
+                        if (opacity < 0) opacity = 0;
+                        
+                        const pushStreak = (coords: number[][], color: string, width: number, op: number) => {
+                            if (coords.length < 2 || op <= 0) return;
+                            features.push({
+                                type: 'Feature',
+                                properties: { opacity: op, color, width },
+                                geometry: { type: 'LineString', coordinates: coords }
+                            });
+                        };
+                        
+                        // Headlights (cyan-ish white)
+                        const hlOpacity = opacity * (headlightsOnRef.current ? 1.0 : 0.0);
+                        pushStreak(streak.headL, '#aaffff', 8, hlOpacity);
+                        pushStreak(streak.headR, '#aaffff', 8, hlOpacity);
+                        pushStreak(streak.headL, '#ffffff', 3, hlOpacity);
+                        pushStreak(streak.headR, '#ffffff', 3, hlOpacity);
+                        
+                        // Taillights (red)
+                        pushStreak(streak.tailL, '#ff1111', 8, opacity);
+                        pushStreak(streak.tailR, '#ff1111', 8, opacity);
+                        pushStreak(streak.tailL, '#ffaaaa', 3, opacity);
+                        pushStreak(streak.tailR, '#ffaaaa', 3, opacity);
+                    }
+                    streakSource.setData({ type: 'FeatureCollection', features } as any);
+                }
+            } catch (e) {}
+        }
 
         if (time - lastStateUpdate > 100) {
           setSpeedMs(physics.speed);
           lastStateUpdate = time;
         }
 
-        const carMoved = prevX !== physics.state.x || prevY !== physics.state.y || prevHeading !== physics.state.heading;
+        const carMoved = prevX !== physics.state.x || prevY !== physics.state.y || prevHeading !== physics.state.heading
+                       || physics.state.velocityZ !== 0 || physics.state.pitch !== 0 || physics.state.roll !== 0;
 
-        if (carMoved) {
-          // Update car source
-          const carSource = map.getSource('car-source') as mapboxgl.GeoJSONSource;
-          if (carSource) {
-            carSource.setData(getCarPolygon(physics.state.x, physics.state.y, physics.state.heading, carModelId) as unknown as GeoJSON.FeatureCollection);
+        if (carMoved && map.isStyleLoaded()) {
+          try {
+            // Update car source
+            const carSource = map.getSource('car-source') as mapboxgl.GeoJSONSource;
+            if (carSource) {
+              const currentGroundZ = map.queryTerrainElevation([physics.state.x, physics.state.y]) || 0;
+              const relativeZ = Math.max(0, physics.state.z - currentGroundZ);
+              
+              carSource.setData(getCarPolygon(
+                physics.state.x, 
+                physics.state.y, 
+                physics.state.heading, 
+                carModelId,
+                relativeZ,
+                physics.state.pitch,
+                physics.state.roll
+              ) as unknown as GeoJSON.FeatureCollection);
+            }
+
+            // Camera follow
+            if (cameraModeRef.current !== 'freecam') {
+              const cam = cameraStateRef.current;
+              const isCockpit = cameraModeRef.current === 'cockpit';
+              
+              // Target camera values
+              const tLng = physics.state.x;
+              const tLat = physics.state.y;
+              const tBearing = physics.state.heading;
+              const tPitch = isCockpit ? 85 : 75;
+              const tZoom = isCockpit ? 21.5 : 19.5;
+              
+              // Smooth lerp (chase cam has slight lag for smoothness, cockpit is tighter)
+              const stiffness = isCockpit ? 30 : 10;
+              const l = (val: number, target: number, speed: number) => val + (target - val) * Math.min(1, speed * dt);
+              
+              cam.lng = l(cam.lng, tLng, stiffness);
+              cam.lat = l(cam.lat, tLat, stiffness);
+              
+              // Angle lerp
+              let db = tBearing - cam.bearing;
+              while (db > 180) db -= 360;
+              while (db < -180) db += 360;
+              cam.bearing += db * Math.min(1, stiffness * dt);
+              
+              cam.pitch = l(cam.pitch, tPitch, 5);
+              cam.zoom = l(cam.zoom, tZoom, 5);
+
+              map.jumpTo({
+                center: [cam.lng, cam.lat],
+                bearing: cam.bearing,
+                pitch: cam.pitch,
+                zoom: cam.zoom
+              });
+            }
+          } catch (e) {
+            // style might be updating
           }
-
-          // Camera follow
-          map.setCenter([physics.state.x, physics.state.y]);
-          map.setBearing(physics.state.heading);
         }
 
-        animationFrameId = requestAnimationFrame(loop);
+        if (!isUnmounted) {
+          animationFrameId = requestAnimationFrame(loop);
+        }
       };
       
       animationFrameId = requestAnimationFrame(loop);
-
-      return () => cancelAnimationFrame(animationFrameId);
     });
 
     return () => {
+      isUnmounted = true;
+      cancelAnimationFrame(animationFrameId);
       map.remove();
     };
   }, [accessToken, initialCarState, mapStyleName, lightPreset, carModelId]);
@@ -303,6 +660,14 @@ export default function MapGame({ accessToken }: MapGameProps) {
         case 'ArrowRight':
         case 'KeyD': state.right = true; break;
         case 'Space': state.handbrake = true; break;
+        case 'KeyC':
+          setCameraMode(prev => {
+            return prev === 'chase' ? 'cockpit' : prev === 'cockpit' ? 'freecam' : 'chase';
+          });
+          break;
+        case 'KeyL':
+          headlightsOnRef.current = !headlightsOnRef.current;
+          break;
       }
     };
 
@@ -364,12 +729,15 @@ export default function MapGame({ accessToken }: MapGameProps) {
         </div>
       </div>
       
-      <div className="absolute bottom-6 left-1/2 -translate-x-1/2 flex gap-4 text-xs opacity-70 z-10 pointer-events-none font-bold tracking-widest bg-black/50 px-4 py-2 rounded text-white">
+      <div className="absolute bottom-6 left-1/2 -translate-x-1/2 flex gap-4 text-xs opacity-70 z-10 pointer-events-none font-bold tracking-widest bg-black/50 px-4 py-2 rounded text-white flex-wrap justify-center">
         <span>[W] GAS</span>
         <span>[S] BRAKE</span>
         <span>[A] LEFT</span>
         <span>[D] RIGHT</span>
         <span>[SPACE] E-BRAKE</span>
+        <span>[L] LIGHTS</span>
+        <span>[C] CAM ({cameraMode.toUpperCase()})</span>
+        <span>[AIR] W/S FLIP, A/D ROLL</span>
       </div>
 
       {/* Settings Menu Modal */}

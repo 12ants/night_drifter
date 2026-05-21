@@ -1,6 +1,14 @@
 import { CarConfig, CAR_MODELS } from './cars';
 
-export function getCarPolygon(x: number, y: number, heading: number, configId: string = 'sport') {
+export function getCarPolygon(
+  x: number, 
+  y: number, 
+  heading: number, 
+  configId: string = 'sport',
+  z: number = 0,
+  pitch: number = 0,
+  roll: number = 0
+) {
   const config = CAR_MODELS[configId] || CAR_MODELS['sport'];
   const length = config.length;
   const width = config.width;
@@ -29,6 +37,18 @@ export function getCarPolygon(x: number, y: number, heading: number, configId: s
   ) => {
     const hl = fLen / 2;
     const hw = lWidth / 2;
+
+    // A very rough simulation of pitch and roll by modifying base and height of the extrusions
+    // Mapbox doesn't support full 3D rotation of fill-extrusion layers, so we just shift them up
+    // and attempt to skew them by creating different base heights? No, fill-extrusion polygon must be flat.
+    // So we just add the car's Z jumping altitude.
+    
+    // We completely disable pitch/roll per-part height offsets to avoid the "wonky / shattered" look.
+    // The car will stay flat relative to itself, but move up and down based on z.
+
+    const actualBase = Math.max(0, z + base);
+    const actualHeight = Math.max(actualBase + 0.1, z + height);
+
     return {
       type: 'Feature',
       geometry: {
@@ -41,7 +61,44 @@ export function getCarPolygon(x: number, y: number, heading: number, configId: s
           localToGlobal(fCenter + hl, lCenter + hw)  // Close
         ]]
       },
-      properties: { height, base, color }
+      properties: { 
+        height: actualHeight, 
+        base: actualBase, 
+        color 
+      }
+    };
+  };
+
+  // Helper to create a wheel feature (chamfered rectangle for a rounder look from top-down)
+  const createWheel = (
+    fCenter: number, lCenter: number,
+    fLen: number, lWidth: number,
+    height: number, base: number, color: string
+  ) => {
+    const hl = fLen / 2;
+    const hw = lWidth / 2;
+    const chamfer = Math.min(hl, hw) * 0.4;
+    
+    const actualBase = Math.max(0, z + base);
+    const actualHeight = Math.max(actualBase + 0.1, z + height);
+
+    return {
+      type: 'Feature',
+      geometry: {
+        type: 'Polygon',
+        coordinates: [[
+          localToGlobal(fCenter + hl - chamfer, lCenter + hw), 
+          localToGlobal(fCenter + hl, lCenter + hw - chamfer),
+          localToGlobal(fCenter + hl, lCenter - hw + chamfer),
+          localToGlobal(fCenter + hl - chamfer, lCenter - hw), 
+          localToGlobal(fCenter - hl + chamfer, lCenter - hw), 
+          localToGlobal(fCenter - hl, lCenter - hw + chamfer),
+          localToGlobal(fCenter - hl, lCenter + hw - chamfer),
+          localToGlobal(fCenter - hl + chamfer, lCenter + hw), 
+          localToGlobal(fCenter + hl - chamfer, lCenter + hw)  // Close
+        ]]
+      },
+      properties: { height: actualHeight, base: actualBase, color }
     };
   };
 
@@ -88,7 +145,7 @@ export function getCarPolygon(x: number, y: number, heading: number, configId: s
     features.push(createRect(-length / 2 + 0.2, 0, 0.3, width * 0.9, 1.2, 1.1, roofColor));
   }
 
-  // Wheels
+    // Wheels
   const wheelOverhang = isTruck ? 0.1 : (isOffroad ? 0.3 : 0.05);
   const wheelL = width / 2 + wheelOverhang;
   const wheelF = length / 2 - (isTruck ? 1.0 : 0.7);
@@ -97,17 +154,19 @@ export function getCarPolygon(x: number, y: number, heading: number, configId: s
   const wWidth = isTruck ? 0.6 : (isOffroad ? 0.5 : 0.35);
   const wheelH = isTruck ? 1.2 : (isOffroad ? 1.0 : 0.7);
   const wheelBase = isTruck ? 0.0 : (isOffroad ? 0.0 : 0.0);
+
+  // We add tires first so they are generated before the main body, wait it doesn't matter for 3d.
   
-  features.push(createRect(wheelF, wheelL, wheelLen, wWidth, wheelH, wheelBase, wheelColor));   // FL
-  features.push(createRect(wheelF, -wheelL, wheelLen, wWidth, wheelH, wheelBase, wheelColor));  // FR
-  features.push(createRect(wheelB, wheelL, wheelLen, wWidth, wheelH, wheelBase, wheelColor));  // BL
-  features.push(createRect(wheelB, -wheelL, wheelLen, wWidth, wheelH, wheelBase, wheelColor)); // BR
+  features.push(createWheel(wheelF, wheelL, wheelLen, wWidth, wheelH, wheelBase, wheelColor));   // FL
+  features.push(createWheel(wheelF, -wheelL, wheelLen, wWidth, wheelH, wheelBase, wheelColor));  // FR
+  features.push(createWheel(wheelB, wheelL, wheelLen, wWidth, wheelH, wheelBase, wheelColor));   // BL
+  features.push(createWheel(wheelB, -wheelL, wheelLen, wWidth, wheelH, wheelBase, wheelColor));  // BR
 
   if (isTruck) {
     // extra wheels for truck
     const wheelB2 = wheelB - 1.4;
-    features.push(createRect(wheelB2, wheelL, wheelLen, wWidth, wheelH, wheelBase, wheelColor));  // BBL
-    features.push(createRect(wheelB2, -wheelL, wheelLen, wWidth, wheelH, wheelBase, wheelColor)); // BBR
+    features.push(createWheel(wheelB2, wheelL, wheelLen, wWidth, wheelH, wheelBase, wheelColor));  // BBL
+    features.push(createWheel(wheelB2, -wheelL, wheelLen, wWidth, wheelH, wheelBase, wheelColor)); // BBR
   }
 
   return {
